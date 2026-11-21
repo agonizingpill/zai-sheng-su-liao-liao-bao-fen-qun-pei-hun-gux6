@@ -8,6 +8,7 @@ from .models import Blend
 from .quality_models import PelletCheck
 from .production_models import Dryer,DryingRun,PelletPack,BlendShipment,ShipmentPack
 from .blending import obj,get,audit,view
+from . import trial_service as trial_svc
 
 def stamp(v):return (v.replace(tzinfo=ZoneInfo('Asia/Shanghai'))if v.tzinfo is None else v).astimezone(timezone.utc)
 def now():return datetime.now(timezone.utc).isoformat()
@@ -26,6 +27,11 @@ def create_dry(s,p,u):
     if dryer.state!='active':raise HTTPException(409,'烘干设备已停用')
     blend=get(s,Blend,p.blend_id,True)
     if blend.status!='released':raise HTTPException(409,'只有已投料配方可安排烘干')
+    trial=trial_svc.paired_dryer_for(s,blend.id,lock=True)
+    if trial:
+        t,member,pair=trial
+        if t.state!='open':raise HTTPException(409,'试验已封账，不能改动配对作业')
+        if pair.dryer_id!=dryer.id:raise HTTPException(409,'试验配对限定同一台机，须在分派设备上开工')
     if s.scalar(select(DryingRun.id).where(DryingRun.blend_id==blend.id)):raise HTTPException(409,'配方已有烘干作业，需在原单延烘复测')
     start,end=stamp(p.starts_at),stamp(p.ends_at)
     if end<=start:raise HTTPException(409,'烘干结束须晚于开始')
@@ -39,7 +45,7 @@ def measure_dry(s,id,p,u):
     if end<datetime.fromisoformat(x.ends_at):raise HTTPException(409,'延烘复测结束时间不得早于已占用结束时间')
     room(s,x.dryer_id,datetime.fromisoformat(x.starts_at),end,x.id)
     x.ends_at=end.isoformat();x.after_moisture=p.after_moisture;x.state='passed'if p.after_moisture<=Decimal('.05')else'redry'
-    x.measurements=[*x.measurements,{'after_moisture':float(p.after_moisture),'ends_at':x.ends_at,'note':p.note,'actor':u['email'],'at':now()}];audit(s,u,'drying_measured',str(x.id)+' / '+x.state);return dry_view(s,x)
+    x.measurements=[*x.measurements,{'after_moisture':float(p.after_moisture),'ends_at':x.ends_at,'note':p.note,'actor':u['email'],'at':now()}];trial_svc.maybe_register_first_test(s,x,u);audit(s,u,'drying_measured',str(x.id)+' / '+x.state);return dry_view(s,x)
 def accept_dry(s,id,u):
     x=get(s,DryingRun,id,True)
     if x.state!='passed':raise HTTPException(409,'烘后含水须≤0.05%且未验收，才能主管确认')
